@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual env
+.venv/
+venv/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Runtime data
+*.log
+*.sqlite
+*.sqlite3
+bridge_state.db
+.service-name
+vk_storage_state.json
+.playwright-cli/
+.vk_debug/
+.vk_media_tmp/
+$tmp
+vk_group_*.png
+vk_post_*.png
+vk_group_snapshot_*.yml
+
+# IDE/OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
