@@ -22,6 +22,7 @@ class Settings:
     tg_bot_token: str
     tg_source_chat_id: int
     tg_admin_id: int
+    tg_admin_chat_id: int | None
     tg_polling_timeout_sec: int
     tg_polling_drop_pending_updates: bool
     vk_group_id: int
@@ -76,10 +77,20 @@ def load_settings() -> Settings:
         except ValueError as exc:
             raise RuntimeError(f"{name} must be an integer, got: {raw}") from exc
 
+    def optional_int(name: str) -> int | None:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
     return Settings(
         tg_bot_token=required("TG_BOT_TOKEN"),
         tg_source_chat_id=required_int("TG_SOURCE_CHAT_ID"),
         tg_admin_id=required_int("TG_ADMIN_ID"),
+        tg_admin_chat_id=optional_int("TG_ADMIN_CHAT_ID"),
         tg_polling_timeout_sec=env_int("TG_POLLING_TIMEOUT_SEC", 50, min_value=1),
         tg_polling_drop_pending_updates=env_bool("TG_POLLING_DROP_PENDING_UPDATES", False),
         vk_group_id=required_int("VK_GROUP_ID"),
@@ -417,9 +428,13 @@ class VkBrowserPoster:
                     "https://vk.com/im",
                 ]
                 for probe_url in probe_urls:
-                    page.goto(probe_url, wait_until="domcontentloaded")
-                    self.wait_for_group_ui(page)
-                    page.wait_for_timeout(2000)
+                    try:
+                        page.goto(probe_url, wait_until="domcontentloaded")
+                        self.wait_for_group_ui(page)
+                        page.wait_for_timeout(2000)
+                    except Exception as exc:
+                        logging.warning("VK token probe failed for url=%s: %s", probe_url, exc)
+                        continue
 
                 self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
                 context.storage_state(path=str(self.storage_state_path))
@@ -801,6 +816,7 @@ class BridgeService:
     CONTINUATION_SUFFIX = "\n\n👇 ПРОДОЛЖЕНИЕ В СЛЕДУЮЩЕМ ПОСТЕ"
     MEDIA_GROUP_DELAY_SECONDS = 1.8
     TG_POLL_OFFSET_STATE_KEY = "tg_polling_offset"
+    ADMIN_CHAT_ID_STATE_KEY = "admin_chat_id"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -866,6 +882,7 @@ class BridgeService:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
+        self.message_map.set_state(self.ADMIN_CHAT_ID_STATE_KEY, str(chat_id))
 
         if command in {"/start", "/status"}:
             response_text = (
@@ -1445,12 +1462,63 @@ class BridgeService:
         self.message_map.set_state(self.TG_POLL_OFFSET_STATE_KEY, str(offset))
 
     async def notify_admin(self, text: str) -> None:
-        admin_id = self.settings.tg_admin_id
+        candidates = self.get_admin_notification_targets()
+        last_error: Exception | None = None
+        for target in candidates:
+            try:
+                await self.send_tg_message(chat_id=target, text=text[:4000])
+                return
+            except Exception as exc:
+                last_error = exc
+                logging.warning("Failed to notify TG admin candidate chat_id=%s: %s", target, exc)
+        if last_error is not None:
+            logging.error("Failed to notify TG admin. tried=%s last_error=%s", candidates, last_error)
 
+    def get_admin_notification_targets(self) -> list[int]:
+        candidates: list[int] = []
+        raw_stored = self.message_map.get_state(self.ADMIN_CHAT_ID_STATE_KEY)
+        if raw_stored:
+            try:
+                candidates.append(int(raw_stored))
+            except ValueError:
+                pass
+        if self.settings.tg_admin_chat_id is not None:
+            candidates.append(self.settings.tg_admin_chat_id)
+        candidates.append(self.settings.tg_admin_id)
+
+        unique: list[int] = []
+        for candidate in candidates:
+            if candidate not in unique:
+                unique.append(candidate)
+        return unique
+
+    async def send_startup_greeting(self) -> None:
         try:
-            await self.send_tg_message(chat_id=admin_id, text=text[:4000])
+            text = (
+                "TG-VK bot started.\n"
+                f"source_chat={self.settings.tg_source_chat_id}\n"
+                f"vk_group={abs(self.settings.vk_group_id)}\n"
+                f"repost_all={self.settings.repost_all_posts}"
+            )
+            await self.notify_admin(text)
+
+            session_status = await asyncio.wait_for(
+                asyncio.to_thread(self.vk_poster.check_session),
+                timeout=90.0,
+            )
+            if session_status.get("ok"):
+                vk_line = (
+                    "VK session check: OK"
+                    f" (token={session_status.get('token_prefix')},"
+                    f" state={session_status.get('storage_state_exists')})"
+                )
+            else:
+                vk_line = f"VK session check: ERROR ({session_status.get('error')})"
+            await self.notify_admin(vk_line)
+        except asyncio.TimeoutError:
+            await self.notify_admin("VK session check: TIMEOUT (startup continues).")
         except Exception:
-            logging.exception("Failed to notify TG admin")
+            logging.exception("Failed to send startup greeting")
 
     async def send_tg_message(self, chat_id: int | str, text: str) -> None:
         url = f"https://api.telegram.org/bot{self.settings.tg_bot_token}/sendMessage"
@@ -1460,6 +1528,11 @@ class BridgeService:
             "disable_web_page_preview": True,
         }
         response = await self.http.post(url, json=payload)
+        if response.status_code >= 400:
+            body_preview = (response.text or "")[:600]
+            raise RuntimeError(
+                f"Telegram sendMessage failed: status={response.status_code}, body={body_preview}"
+            )
         response.raise_for_status()
 
 def configure_logging(level: str) -> None:
@@ -1473,8 +1546,10 @@ async def run_polling(settings: Settings) -> None:
     service = BridgeService(settings)
     offset = service.get_polling_offset()
     backoff_seconds = 3.0
+    startup_task: asyncio.Task[None] | None = None
     try:
         await service.reset_tg_update_delivery()
+        startup_task = asyncio.create_task(service.send_startup_greeting())
         while True:
             try:
                 updates = await service.fetch_tg_updates(offset=offset)
@@ -1495,6 +1570,9 @@ async def run_polling(settings: Settings) -> None:
                 logging.exception("Polling loop failed, retrying")
                 await asyncio.sleep(backoff_seconds)
     finally:
+        if startup_task is not None:
+            startup_task.cancel()
+            await asyncio.gather(startup_task, return_exceptions=True)
         await service.close()
 
 

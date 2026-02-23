@@ -43,6 +43,7 @@ copy .env.example .env
 - `VK_STORAGE_STATE_PATH` (файл сессии VK, например `vk_storage_state.json`)
 
 Опциональные:
+- `TG_ADMIN_CHAT_ID` (куда слать сервисные уведомления; если не задан, бот использует `TG_ADMIN_ID` и/или последний админский чат из `/start`)
 - `VK_BROWSER_HEADLESS` (`true` по умолчанию)
 - `VK_BROWSER_CHANNEL` (например `chrome`, `msedge`; можно пусто)
 - `VK_BROWSER_TIMEOUT_SEC` (по умолчанию `60`)
