@@ -22,7 +22,6 @@ class Settings:
     tg_bot_token: str
     tg_source_chat_id: int
     tg_admin_id: int
-    tg_admin_chat_id: int | None
     tg_polling_timeout_sec: int
     tg_polling_drop_pending_updates: bool
     vk_group_id: int
@@ -77,20 +76,10 @@ def load_settings() -> Settings:
         except ValueError as exc:
             raise RuntimeError(f"{name} must be an integer, got: {raw}") from exc
 
-    def optional_int(name: str) -> int | None:
-        raw = (os.getenv(name) or "").strip()
-        if not raw:
-            return None
-        try:
-            return int(raw)
-        except ValueError:
-            return None
-
     return Settings(
         tg_bot_token=required("TG_BOT_TOKEN"),
         tg_source_chat_id=required_int("TG_SOURCE_CHAT_ID"),
         tg_admin_id=required_int("TG_ADMIN_ID"),
-        tg_admin_chat_id=optional_int("TG_ADMIN_CHAT_ID"),
         tg_polling_timeout_sec=env_int("TG_POLLING_TIMEOUT_SEC", 50, min_value=1),
         tg_polling_drop_pending_updates=env_bool("TG_POLLING_DROP_PENDING_UPDATES", False),
         vk_group_id=required_int("VK_GROUP_ID"),
@@ -816,7 +805,6 @@ class BridgeService:
     CONTINUATION_SUFFIX = "\n\n👇 ПРОДОЛЖЕНИЕ В СЛЕДУЮЩЕМ ПОСТЕ"
     MEDIA_GROUP_DELAY_SECONDS = 1.8
     TG_POLL_OFFSET_STATE_KEY = "tg_polling_offset"
-    ADMIN_CHAT_ID_STATE_KEY = "admin_chat_id"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -882,8 +870,6 @@ class BridgeService:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
-        self.message_map.set_state(self.ADMIN_CHAT_ID_STATE_KEY, str(chat_id))
-
         if command in {"/start", "/status"}:
             response_text = (
                 "Привет, админ. Я работаю.\n"
@@ -1462,35 +1448,11 @@ class BridgeService:
         self.message_map.set_state(self.TG_POLL_OFFSET_STATE_KEY, str(offset))
 
     async def notify_admin(self, text: str) -> None:
-        candidates = self.get_admin_notification_targets()
-        last_error: Exception | None = None
-        for target in candidates:
-            try:
-                await self.send_tg_message(chat_id=target, text=text[:4000])
-                return
-            except Exception as exc:
-                last_error = exc
-                logging.warning("Failed to notify TG admin candidate chat_id=%s: %s", target, exc)
-        if last_error is not None:
-            logging.error("Failed to notify TG admin. tried=%s last_error=%s", candidates, last_error)
-
-    def get_admin_notification_targets(self) -> list[int]:
-        candidates: list[int] = []
-        raw_stored = self.message_map.get_state(self.ADMIN_CHAT_ID_STATE_KEY)
-        if raw_stored:
-            try:
-                candidates.append(int(raw_stored))
-            except ValueError:
-                pass
-        if self.settings.tg_admin_chat_id is not None:
-            candidates.append(self.settings.tg_admin_chat_id)
-        candidates.append(self.settings.tg_admin_id)
-
-        unique: list[int] = []
-        for candidate in candidates:
-            if candidate not in unique:
-                unique.append(candidate)
-        return unique
+        admin_id = self.settings.tg_admin_id
+        try:
+            await self.send_tg_message(chat_id=admin_id, text=text[:4000])
+        except Exception:
+            logging.exception("Failed to notify TG admin (chat_id=%s)", admin_id)
 
     async def send_startup_greeting(self) -> None:
         try:
