@@ -225,6 +225,10 @@ class VkBrowserPoster:
         with self.lock:
             return self._check_session_impl()
 
+    def edit_post(self, post_id: int, text: str, attachment_paths: list[str]) -> bool:
+        with self.lock:
+            return self._edit_post_impl(post_id=post_id, text=text, attachment_paths=attachment_paths)
+
     def _post_impl(self, text: str, attachment_paths: list[str]) -> str | None:
         token_info = self.extract_web_access_token()
         token = token_info["token"]
@@ -276,6 +280,32 @@ class VkBrowserPoster:
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc), "url": ""}
+
+    def _edit_post_impl(self, post_id: int, text: str, attachment_paths: list[str]) -> bool:
+        token_info = self.extract_web_access_token()
+        token = token_info["token"]
+        with httpx.Client(timeout=120.0) as client:
+            attachments = self.upload_attachments_via_api(
+                client=client,
+                token=token,
+                attachment_paths=attachment_paths,
+            )
+            response = self.vk_api_call(
+                client=client,
+                method="wall.edit",
+                token=token,
+                owner_id=-self.group_id,
+                post_id=post_id,
+                message=text,
+                attachments=",".join(attachments) if attachments else "",
+                signed=0,
+            )
+        if isinstance(response, int):
+            return response == 1
+        if isinstance(response, dict):
+            result = response.get("post_id")
+            return result is not None
+        return False
 
     @staticmethod
     def find_first_visible(
@@ -1023,10 +1053,134 @@ class BridgeService:
     async def process_edited_post(self, post: dict[str, Any]) -> None:
         if not self.settings.vk_enable_edit_sync:
             return
-        await self.notify_admin(
-            "WARN: edited_channel_post received, but edit sync is not supported in browser posting mode."
-        )
-        return
+
+        tg_message_id = self.extract_tg_message_id(post)
+        tg_chat_id = self.extract_tg_chat_id(post)
+        if tg_message_id is None or tg_chat_id is None:
+            return
+
+        source_text, entities = self.extract_text_and_entities(post)
+        should_repost_now = self.should_repost(source_text)
+        existing_vk_post_ids = self.message_map.get_ids(tg_chat_id, tg_message_id)
+
+        media_group_id = post.get("media_group_id")
+        if isinstance(media_group_id, str) and media_group_id:
+            await self.process_edited_media_group_post(
+                post=post,
+                should_repost_now=should_repost_now,
+            )
+            return
+
+        if not should_repost_now:
+            return
+
+        try:
+            text = self.convert_tg_entities_to_vk_text(source_text, entities).strip()
+            attachments = await self.build_vk_attachments(post)
+            if not text and not attachments:
+                return
+
+            if not existing_vk_post_ids:
+                vk_post_ids = await self.publish_to_vk(text=text, attachments=attachments)
+                vk_post_id = vk_post_ids[0] if vk_post_ids else None
+                if vk_post_id:
+                    self.message_map.put_ids(tg_chat_id, tg_message_id, vk_post_ids)
+                await self.notify_admin(
+                    f"OK: edited post {tg_message_id} became eligible and was published to VK"
+                    + (f" (vk_post_id={vk_post_id})" if vk_post_id else "")
+                )
+                return
+
+            edited, edit_reason = await self.edit_existing_vk_post(
+                tg_message_id=tg_message_id,
+                vk_post_ids=existing_vk_post_ids,
+                text=text,
+                attachments=attachments,
+            )
+            if edited:
+                await self.notify_admin(
+                    f"OK: edited post {tg_message_id} synced to existing VK post {existing_vk_post_ids[0]}"
+                )
+                return
+
+            await self.notify_admin(
+                f"WARN: edited post {tg_message_id} sync skipped ({edit_reason})."
+            )
+        except Exception as exc:
+            logging.exception("Failed to process edited post %s", tg_message_id)
+            await self.notify_admin(f"ERROR: edited post {tg_message_id} failed: {exc}")
+
+    async def process_edited_media_group_post(
+        self,
+        post: dict[str, Any],
+        should_repost_now: bool,
+    ) -> None:
+        group_key = self.media_group_key(post)
+        posts_for_group: list[dict[str, Any]] = []
+        async with self.media_group_lock:
+            archived_posts = self.media_group_archive.get(group_key)
+            if not archived_posts:
+                return
+
+            updated_posts: list[dict[str, Any]] = []
+            replaced = False
+            edited_message_id = self.extract_tg_message_id(post)
+            for item in archived_posts:
+                item_message_id = self.extract_tg_message_id(item)
+                if (
+                    edited_message_id is not None
+                    and item_message_id is not None
+                    and item_message_id == edited_message_id
+                ):
+                    updated_posts.append(post)
+                    replaced = True
+                else:
+                    updated_posts.append(item)
+            if not replaced:
+                updated_posts.append(post)
+
+            updated_posts.sort(key=lambda p: int(p.get("message_id") or 0))
+            self.media_group_archive[group_key] = updated_posts
+            posts_for_group = list(updated_posts)
+
+        if should_repost_now:
+            await self.process_media_group(posts_for_group)
+
+    async def edit_existing_vk_post(
+        self,
+        tg_message_id: int,
+        vk_post_ids: list[str],
+        text: str,
+        attachments: list[str],
+    ) -> tuple[bool, str]:
+        if len(vk_post_ids) != 1:
+            self.cleanup_media_files(attachments)
+            return False, "multiple VK posts are mapped"
+
+        vk_post_id_raw = vk_post_ids[0]
+        if not vk_post_id_raw.isdigit():
+            self.cleanup_media_files(attachments)
+            return False, "invalid VK post id"
+
+        try:
+            safe_text = (text or "")[: self.VK_TEXT_LIMIT]
+            edited = await asyncio.to_thread(
+                self.vk_poster.edit_post,
+                int(vk_post_id_raw),
+                safe_text,
+                attachments,
+            )
+            if edited:
+                return True, "ok"
+            return False, "VK wall.edit returned no success flag"
+        except Exception as exc:
+            logging.exception("Failed to sync edited TG post %s to VK post %s", tg_message_id, vk_post_id_raw)
+            await self.notify_admin(
+                f"ERROR: failed to update existing VK post {vk_post_id_raw} for TG post {tg_message_id}: {exc}"
+            )
+            return False, "VK wall.edit failed"
+        finally:
+            self.cleanup_media_files(attachments)
 
     def should_repost(self, text: str) -> bool:
         if self.settings.repost_all_posts:
