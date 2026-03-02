@@ -21,6 +21,8 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
+from playwright_guard import PlaywrightProcessGuard, close_playwright_objects
+
 AUTH_ENDPOINT = "https://id.vk.com/authorize"
 TOKEN_ENDPOINT = "https://id.vk.com/oauth2/auth"
 DEFAULT_SCOPES = "wall photos video docs offline"
@@ -403,34 +405,45 @@ def cmd_playwright_auto(args: argparse.Namespace) -> int:
 
     deadline = time.monotonic() + args.wait_timeout
     redirected_data: dict[str, str] | None = None
+    process_guard = PlaywrightProcessGuard()
+    browser = None
+    context = None
+    page = None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
-        context = browser.new_context(ignore_https_errors=True)
-        page = context.new_page()
-        page.goto(auth_url, wait_until="domcontentloaded")
+        try:
+            browser = p.chromium.launch(headless=args.headless)
+            process_guard.mark_spawned()
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+            page.goto(auth_url, wait_until="domcontentloaded")
 
-        while time.monotonic() < deadline and redirected_data is None:
-            pages = list(context.pages)
-            for pg in pages:
-                current_url = pg.url
-                if not current_url:
-                    continue
-                if current_url.startswith(args.redirect_uri):
-                    data = parse_redirect_url(current_url)
-                    if data.get("code") or data.get("code_v2"):
-                        redirected_data = data
-                        safe = {k: v for k, v in data.items() if k != "ext_id"}
-                        print(f"Redirect detected: {args.redirect_uri}?{urlencode(safe)}")
-                        break
-            time.sleep(0.25)
+            while time.monotonic() < deadline and redirected_data is None:
+                pages = list(context.pages)
+                for pg in pages:
+                    current_url = pg.url
+                    if not current_url:
+                        continue
+                    if current_url.startswith(args.redirect_uri):
+                        data = parse_redirect_url(current_url)
+                        if data.get("code") or data.get("code_v2"):
+                            redirected_data = data
+                            safe = {k: v for k, v in data.items() if k != "ext_id"}
+                            print(f"Redirect detected: {args.redirect_uri}?{urlencode(safe)}")
+                            break
+                time.sleep(0.25)
 
-        if redirected_data is None:
-            print("Error: timeout waiting for redirect URL in browser.", file=sys.stderr)
-            browser.close()
-            return 1
-
-        browser.close()
+            if redirected_data is None:
+                print("Error: timeout waiting for redirect URL in browser.", file=sys.stderr)
+                return 1
+        finally:
+            close_playwright_objects(page=page, context=context, browser=browser)
+            survivors = process_guard.cleanup()
+            if survivors:
+                print(
+                    f"Warning: Playwright cleanup left running processes: {survivors}",
+                    file=sys.stderr,
+                )
 
     redirect_state = redirected_data.get("state")
     if redirect_state and redirect_state != state:

@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from playwright_guard import PlaywrightProcessGuard, close_playwright_objects
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -115,35 +117,39 @@ def main() -> int:
     if args.channel:
         launch_kwargs["channel"] = args.channel
 
+    process_guard = PlaywrightProcessGuard()
+    browser = None
+    context = None
+    page = None
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_kwargs)
-
-        context_kwargs = {}
-        if storage_state_path.exists():
-            context_kwargs["storage_state"] = str(storage_state_path)
-        context = browser.new_context(**context_kwargs)
-        context.on("dialog", safe_dismiss_dialog)
-
-        page = context.new_page()
-        page.on("dialog", safe_dismiss_dialog)
-        page.goto(args.start_url, wait_until="domcontentloaded")
-
-        print("\nBrowser opened.")
-        print("1) Complete VK login/2FA manually in the opened window.")
-        print("2) Navigate to your target group page if needed.")
-        print("3) Return here and press Enter.\n")
-        input("Press Enter after login is complete: ")
-
-        mode = save_storage_state_with_fallback(context, storage_state_path)
-        print(f"Storage state save mode: {mode}")
         try:
-            context.close()
-        except Exception:
-            pass
-        try:
-            browser.close()
-        except Exception:
-            pass
+            browser = p.chromium.launch(**launch_kwargs)
+            process_guard.mark_spawned()
+
+            context_kwargs = {}
+            if storage_state_path.exists():
+                context_kwargs["storage_state"] = str(storage_state_path)
+            context = browser.new_context(**context_kwargs)
+            context.on("dialog", safe_dismiss_dialog)
+
+            page = context.new_page()
+            page.on("dialog", safe_dismiss_dialog)
+            page.goto(args.start_url, wait_until="domcontentloaded")
+
+            print("\nBrowser opened.")
+            print("1) Complete VK login/2FA manually in the opened window.")
+            print("2) Navigate to your target group page if needed.")
+            print("3) Return here and press Enter.\n")
+            input("Press Enter after login is complete: ")
+
+            mode = save_storage_state_with_fallback(context, storage_state_path)
+            print(f"Storage state save mode: {mode}")
+        finally:
+            close_playwright_objects(page=page, context=context, browser=browser)
+            survivors = process_guard.cleanup()
+            if survivors:
+                print(f"Warning: Playwright cleanup left running processes: {survivors}")
 
     print(f"Saved storage state: {storage_state_path}")
     return 0

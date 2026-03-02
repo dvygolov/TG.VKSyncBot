@@ -11,10 +11,12 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from dotenv import load_dotenv
+
+from playwright_guard import PlaywrightProcessGuard, close_playwright_objects
 
 
 @dataclass
@@ -205,6 +207,14 @@ class MessageMapStore:
         return row[0]
 
 
+class VkApiError(RuntimeError):
+    def __init__(self, method: str, code: int | None, message: str) -> None:
+        self.method = method
+        self.code = code
+        self.message = message
+        super().__init__(f"VK API {method} failed: code={code} message={message}")
+
+
 class VkBrowserPoster:
     VK_API_BASE = "https://api.vk.com/method"
     VK_API_VERSION = "5.269"
@@ -216,6 +226,8 @@ class VkBrowserPoster:
         self.browser_channel = settings.vk_browser_channel
         self.timeout_ms = settings.vk_browser_timeout_sec * 1000
         self.lock = Lock()
+        self._cached_token: str | None = None
+        self._cached_token_url: str = ""
 
     def post(self, text: str, attachment_paths: list[str]) -> str | None:
         with self.lock:
@@ -230,15 +242,13 @@ class VkBrowserPoster:
             return self._edit_post_impl(post_id=post_id, text=text, attachment_paths=attachment_paths)
 
     def _post_impl(self, text: str, attachment_paths: list[str]) -> str | None:
-        token_info = self.extract_web_access_token()
-        token = token_info["token"]
-        with httpx.Client(timeout=120.0) as client:
+        def operation(client: httpx.Client, token: str) -> Any:
             attachments = self.upload_attachments_via_api(
                 client=client,
                 token=token,
                 attachment_paths=attachment_paths,
             )
-            response = self.vk_api_call(
+            return self.vk_api_call(
                 client=client,
                 method="wall.post",
                 token=token,
@@ -250,15 +260,14 @@ class VkBrowserPoster:
                 close_comments=0,
                 mute_notifications=0,
             )
+
+        response, _ = self.call_with_token_retry(timeout_sec=120.0, operation=operation)
         post_id = response.get("post_id")
         return str(post_id) if post_id is not None else None
 
     def _check_session_impl(self) -> dict[str, Any]:
         try:
-            token_info = self.extract_web_access_token()
-            token = token_info["token"]
-            current_url = token_info.get("url", "")
-            with httpx.Client(timeout=60.0) as client:
+            def operation(client: httpx.Client, token: str) -> None:
                 self.vk_api_call(
                     client=client,
                     method="groups.getById",
@@ -272,25 +281,28 @@ class VkBrowserPoster:
                     owner_id=-self.group_id,
                     count=1,
                 )
+
+            _, token_info = self.call_with_token_retry(timeout_sec=60.0, operation=operation)
+            token = token_info["token"]
+            current_url = token_info.get("url", "")
             return {
                 "ok": True,
                 "url": current_url,
                 "storage_state_exists": self.storage_state_path.exists(),
                 "token_prefix": token[:24],
+                "token_source": token_info.get("source", ""),
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc), "url": ""}
 
     def _edit_post_impl(self, post_id: int, text: str, attachment_paths: list[str]) -> bool:
-        token_info = self.extract_web_access_token()
-        token = token_info["token"]
-        with httpx.Client(timeout=120.0) as client:
+        def operation(client: httpx.Client, token: str) -> Any:
             attachments = self.upload_attachments_via_api(
                 client=client,
                 token=token,
                 attachment_paths=attachment_paths,
             )
-            response = self.vk_api_call(
+            return self.vk_api_call(
                 client=client,
                 method="wall.edit",
                 token=token,
@@ -300,12 +312,69 @@ class VkBrowserPoster:
                 attachments=",".join(attachments) if attachments else "",
                 signed=0,
             )
+
+        response, _ = self.call_with_token_retry(timeout_sec=120.0, operation=operation)
         if isinstance(response, int):
             return response == 1
         if isinstance(response, dict):
             result = response.get("post_id")
             return result is not None
         return False
+
+    def get_web_access_token(self, force_refresh: bool = False) -> dict[str, str]:
+        if not force_refresh and self._cached_token:
+            return {
+                "token": self._cached_token,
+                "url": self._cached_token_url,
+                "source": "cache",
+            }
+
+        token_info = self.extract_web_access_token()
+        token = token_info.get("token")
+        if not token:
+            raise RuntimeError("VK token extraction returned empty token.")
+        self._cached_token = token
+        self._cached_token_url = token_info.get("url", "")
+        return {
+            "token": token,
+            "url": self._cached_token_url,
+            "source": "browser",
+        }
+
+    def invalidate_cached_token(self) -> None:
+        self._cached_token = None
+        self._cached_token_url = ""
+
+    def is_token_expired_error(self, exc: Exception) -> bool:
+        if isinstance(exc, VkApiError):
+            if exc.code == 5:
+                return True
+            lowered = (exc.message or "").lower()
+            return "access token" in lowered or ("token" in lowered and "auth" in lowered)
+        lowered = str(exc).lower()
+        return "code=5" in lowered or "access token" in lowered
+
+    def call_with_token_retry(
+        self,
+        *,
+        timeout_sec: float,
+        operation: Callable[[httpx.Client, str], Any],
+    ) -> tuple[Any, dict[str, str]]:
+        token_info = self.get_web_access_token(force_refresh=False)
+        with httpx.Client(timeout=timeout_sec) as client:
+            try:
+                result = operation(client, token_info["token"])
+                return result, token_info
+            except Exception as exc:
+                if not self.is_token_expired_error(exc):
+                    raise
+                logging.warning("VK token rejected, refreshing token and retrying once: %s", exc)
+
+        self.invalidate_cached_token()
+        token_info = self.get_web_access_token(force_refresh=True)
+        with httpx.Client(timeout=timeout_sec) as client:
+            result = operation(client, token_info["token"])
+        return result, token_info
 
     @staticmethod
     def find_first_visible(
@@ -414,6 +483,7 @@ class VkBrowserPoster:
         captured_tokens: list[str] = []
         token_sources: dict[str, str] = {}
         debug_screenshot: str | None = None
+        process_guard = PlaywrightProcessGuard()
 
         browser = None
         context = None
@@ -421,6 +491,7 @@ class VkBrowserPoster:
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(**launch_kwargs)
+                process_guard.mark_spawned()
                 context_kwargs: dict[str, Any] = {}
                 if self.storage_state_path.exists():
                     context_kwargs["storage_state"] = str(self.storage_state_path)
@@ -479,16 +550,10 @@ class VkBrowserPoster:
         finally:
             if page is not None and debug_screenshot is not None:
                 logging.warning("VK token extraction failed screenshot: %s", debug_screenshot)
-            try:
-                if context is not None:
-                    context.close()
-            except Exception:
-                pass
-            try:
-                if browser is not None:
-                    browser.close()
-            except Exception:
-                pass
+            close_playwright_objects(page=page, context=context, browser=browser)
+            survivors = process_guard.cleanup()
+            if survivors:
+                logging.warning("Playwright cleanup left running processes: %s", survivors)
 
     def vk_api_call(
         self,
@@ -520,8 +585,8 @@ class VkBrowserPoster:
             if code == 6 and attempt < 4:
                 time.sleep(0.45)
                 continue
-            raise RuntimeError(f"VK API {method} failed: code={code} message={message}")
-        raise RuntimeError(f"VK API {method} failed after retries.")
+            raise VkApiError(method=method, code=code, message=message)
+        raise VkApiError(method=method, code=None, message="failed after retries")
 
     def upload_attachments_via_api(
         self,
@@ -917,6 +982,7 @@ class BridgeService:
                 "VK session check: OK\n"
                 f"url={session_status.get('url')}\n"
                 f"token_prefix={session_status.get('token_prefix')}\n"
+                f"token_source={session_status.get('token_source')}\n"
                 f"storage_state_exists={session_status.get('storage_state_exists')}"
             )
             await self.send_tg_message(chat_id=chat_id, text=response_text)
