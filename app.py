@@ -32,6 +32,7 @@ class Settings:
     vk_browser_headless: bool
     vk_browser_channel: str
     vk_browser_timeout_sec: int
+    vk_operation_timeout_sec: int
     vk_media_tmp_dir: str
     state_db_path: str
     repost_all_posts: bool
@@ -90,6 +91,7 @@ def load_settings() -> Settings:
         vk_browser_headless=env_bool("VK_BROWSER_HEADLESS", True),
         vk_browser_channel=(os.getenv("VK_BROWSER_CHANNEL") or "").strip(),
         vk_browser_timeout_sec=env_int("VK_BROWSER_TIMEOUT_SEC", 60, min_value=10),
+        vk_operation_timeout_sec=env_int("VK_OPERATION_TIMEOUT_SEC", 180, min_value=30),
         vk_media_tmp_dir=(os.getenv("VK_MEDIA_TMP_DIR") or ".vk_media_tmp").strip(),
         state_db_path=os.getenv("STATE_DB_PATH", "bridge_state.db"),
         repost_all_posts=env_bool("REPOST_ALL_POSTS", True),
@@ -225,21 +227,44 @@ class VkBrowserPoster:
         self.browser_headless = settings.vk_browser_headless
         self.browser_channel = settings.vk_browser_channel
         self.timeout_ms = settings.vk_browser_timeout_sec * 1000
+        self.operation_timeout_sec = settings.vk_operation_timeout_sec
         self.lock = Lock()
         self._cached_token: str | None = None
         self._cached_token_url: str = ""
 
     def post(self, text: str, attachment_paths: list[str]) -> str | None:
-        with self.lock:
-            return self._post_impl(text=text, attachment_paths=attachment_paths)
+        return self._run_with_lock(
+            operation_name="VK post",
+            operation=lambda: self._post_impl(text=text, attachment_paths=attachment_paths),
+        )
 
     def check_session(self) -> dict[str, Any]:
-        with self.lock:
-            return self._check_session_impl()
+        return self._run_with_lock(
+            operation_name="VK session check",
+            operation=self._check_session_impl,
+        )
 
     def edit_post(self, post_id: int, text: str, attachment_paths: list[str]) -> bool:
-        with self.lock:
-            return self._edit_post_impl(post_id=post_id, text=text, attachment_paths=attachment_paths)
+        return self._run_with_lock(
+            operation_name="VK edit",
+            operation=lambda: self._edit_post_impl(
+                post_id=post_id,
+                text=text,
+                attachment_paths=attachment_paths,
+            ),
+        )
+
+    def _run_with_lock(self, *, operation_name: str, operation: Callable[[], Any]) -> Any:
+        acquired = self.lock.acquire(timeout=float(self.operation_timeout_sec))
+        if not acquired:
+            raise RuntimeError(
+                f"{operation_name} lock timeout after {self.operation_timeout_sec}s. "
+                "Previous VK operation is likely stuck."
+            )
+        try:
+            return operation()
+        finally:
+            self.lock.release()
 
     def _post_impl(self, text: str, attachment_paths: list[str]) -> str | None:
         def operation(client: httpx.Client, token: str) -> Any:
@@ -976,7 +1001,7 @@ class BridgeService:
             await self.send_tg_message(chat_id=chat_id, text=response_text)
             return
 
-        session_status = await asyncio.to_thread(self.vk_poster.check_session)
+        session_status = await self.run_vk_worker("VK session check", self.vk_poster.check_session)
         if session_status.get("ok"):
             response_text = (
                 "VK session check: OK\n"
@@ -1230,7 +1255,8 @@ class BridgeService:
 
         try:
             safe_text = (text or "")[: self.VK_TEXT_LIMIT]
-            edited = await asyncio.to_thread(
+            edited = await self.run_vk_worker(
+                "VK edit",
                 self.vk_poster.edit_post,
                 int(vk_post_id_raw),
                 safe_text,
@@ -1620,7 +1646,19 @@ class BridgeService:
             attachments = attachments[:10]
 
         safe_text = (text or "")[: self.VK_TEXT_LIMIT]
-        return await asyncio.to_thread(self.vk_poster.post, safe_text, attachments)
+        return await self.run_vk_worker(
+            "VK post",
+            self.vk_poster.post,
+            safe_text,
+            attachments,
+        )
+
+    async def run_vk_worker(self, operation_name: str, func: Callable[..., Any], *args: Any) -> Any:
+        timeout_sec = float(self.settings.vk_operation_timeout_sec)
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout_sec)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"{operation_name} timed out after {self.settings.vk_operation_timeout_sec}s") from exc
 
     async def reset_tg_update_delivery(self) -> None:
         url = f"https://api.telegram.org/bot{self.settings.tg_bot_token}/setWebhook"
@@ -1683,22 +1721,6 @@ class BridgeService:
                 f"repost_all={self.settings.repost_all_posts}"
             )
             await self.notify_admin(text)
-
-            session_status = await asyncio.wait_for(
-                asyncio.to_thread(self.vk_poster.check_session),
-                timeout=90.0,
-            )
-            if session_status.get("ok"):
-                vk_line = (
-                    "VK session check: OK"
-                    f" (token={session_status.get('token_prefix')},"
-                    f" state={session_status.get('storage_state_exists')})"
-                )
-            else:
-                vk_line = f"VK session check: ERROR ({session_status.get('error')})"
-            await self.notify_admin(vk_line)
-        except asyncio.TimeoutError:
-            await self.notify_admin("VK session check: TIMEOUT (startup continues).")
         except Exception:
             logging.exception("Failed to send startup greeting")
 
@@ -1739,10 +1761,10 @@ async def run_polling(settings: Settings) -> None:
                     continue
                 for update in updates:
                     update_id = update.get("update_id")
+                    await service.handle_tg_update(update)
                     if isinstance(update_id, int):
                         offset = update_id + 1
                         service.set_polling_offset(offset)
-                    await service.handle_tg_update(update)
             except asyncio.CancelledError:
                 raise
             except httpx.ReadTimeout:

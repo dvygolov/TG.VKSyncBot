@@ -47,6 +47,7 @@ copy .env.example .env
 - `VK_BROWSER_HEADLESS` (`true` по умолчанию)
 - `VK_BROWSER_CHANNEL` (например `chrome`, `msedge`; можно пусто)
 - `VK_BROWSER_TIMEOUT_SEC` (по умолчанию `60`)
+- `VK_OPERATION_TIMEOUT_SEC` (таймаут одной операции post/edit/check, по умолчанию `180`)
 - `VK_MEDIA_TMP_DIR` (временная папка для медиа, по умолчанию `.vk_media_tmp`)
 - `STATE_DB_PATH`
 - `REPOST_ALL_POSTS`
