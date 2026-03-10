@@ -358,7 +358,9 @@ class VkBrowserPoster:
                 "source": "cache",
             }
 
-        token_info = self.extract_web_access_token()
+        token_info = self.extract_token_from_storage_state()
+        if not token_info:
+            token_info = self.extract_web_access_token()
         token = token_info.get("token")
         if not token:
             raise RuntimeError("VK token extraction returned empty token.")
@@ -497,6 +499,56 @@ class VkBrowserPoster:
         token_match = re.search(r"access_token=([^&\"'\\s]+)", raw)
         if token_match:
             return token_match.group(1)
+        return None
+
+    def extract_token_from_storage_state(self) -> dict[str, str] | None:
+        if not self.storage_state_path.exists():
+            return None
+
+        try:
+            payload = json.loads(self.storage_state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.warning("Failed to parse VK storage state file %s: %s", self.storage_state_path, exc)
+            return None
+
+        for origin in payload.get("origins", []):
+            origin_url = origin.get("origin", "")
+            for item in origin.get("localStorage", []):
+                name = item.get("name", "")
+                raw_value = item.get("value")
+
+                token = self.extract_token_from_text(raw_value)
+                if token:
+                    return {
+                        "token": token,
+                        "url": f"localStorage:{origin_url}:{name}",
+                        "source": "storage_state_local_storage",
+                    }
+
+                try:
+                    parsed_value = json.loads(raw_value)
+                except Exception:
+                    continue
+
+                if not isinstance(parsed_value, dict):
+                    continue
+
+                token = self.extract_token_from_text(parsed_value.get("access_token"))
+                if token:
+                    return {
+                        "token": token,
+                        "url": f"localStorage:{origin_url}:{name}",
+                        "source": "storage_state_local_storage",
+                    }
+
+        for cookie in payload.get("cookies", []):
+            value = self.extract_token_from_text(cookie.get("value"))
+            if value:
+                return {
+                    "token": value,
+                    "url": f"cookie:{cookie.get('domain', '')}:{cookie.get('name', '')}",
+                    "source": "storage_state_cookie",
+                }
         return None
 
     def extract_web_access_token(self) -> dict[str, str]:
