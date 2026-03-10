@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
 import re
+import signal
 import sqlite3
+import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -935,6 +939,7 @@ class BridgeService:
         self.media_group_tasks: dict[str, asyncio.Task[None]] = {}
         self.media_group_archive: dict[str, list[dict[str, Any]]] = {}
         self.media_group_lock = asyncio.Lock()
+        self.vk_worker_lock = asyncio.Lock()
         self.vk_poster = VkBrowserPoster(settings)
         self.media_tmp_dir = Path(settings.vk_media_tmp_dir)
         self.media_tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -1654,11 +1659,85 @@ class BridgeService:
         )
 
     async def run_vk_worker(self, operation_name: str, func: Callable[..., Any], *args: Any) -> Any:
-        timeout_sec = float(self.settings.vk_operation_timeout_sec)
+        operation_map: dict[Callable[..., Any], str] = {
+            self.vk_poster.post: "post",
+            self.vk_poster.edit_post: "edit",
+            self.vk_poster.check_session: "check_session",
+        }
+        worker_operation = operation_map.get(func)
+        if not worker_operation:
+            raise RuntimeError(f"Unsupported VK worker operation: {operation_name}")
+
+        payload = {
+            "args": list(args),
+        }
+        worker_path = Path(__file__).with_name("vk_op_worker.py")
+        command = [sys.executable, str(worker_path), worker_operation]
+
+        creationflags = 0
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        async with self.vk_worker_lock:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                **popen_kwargs,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(json.dumps(payload).encode("utf-8")),
+                    timeout=float(self.settings.vk_operation_timeout_sec),
+                )
+            except asyncio.TimeoutError as exc:
+                await self.terminate_vk_worker_process(process)
+                raise RuntimeError(
+                    f"{operation_name} timed out after {self.settings.vk_operation_timeout_sec}s"
+                ) from exc
+
+        if process.returncode != 0:
+            stderr_preview = (stderr or b"").decode("utf-8", errors="replace").strip()[:1000]
+            raise RuntimeError(
+                f"{operation_name} worker failed with code {process.returncode}: {stderr_preview}"
+            )
+
         try:
-            return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout_sec)
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(f"{operation_name} timed out after {self.settings.vk_operation_timeout_sec}s") from exc
+            response = json.loads((stdout or b"{}").decode("utf-8", errors="replace"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{operation_name} worker returned invalid JSON") from exc
+
+        if not response.get("ok"):
+            error_text = str(response.get("error") or "Unknown VK worker error")
+            raise RuntimeError(error_text)
+        return response.get("result")
+
+    async def terminate_vk_worker_process(self, process: asyncio.subprocess.Process) -> None:
+        try:
+            if process.returncode is not None:
+                return
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except Exception:
+            pass
 
     async def reset_tg_update_delivery(self) -> None:
         url = f"https://api.telegram.org/bot{self.settings.tg_bot_token}/setWebhook"
