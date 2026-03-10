@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import mimetypes
@@ -27,6 +28,7 @@ from playwright_guard import PlaywrightProcessGuard, close_playwright_objects
 class Settings:
     tg_bot_token: str
     tg_source_chat_id: int
+    tg_source_chat_username: str
     tg_admin_id: int
     tg_polling_timeout_sec: int
     tg_polling_drop_pending_updates: bool
@@ -86,6 +88,7 @@ def load_settings() -> Settings:
     return Settings(
         tg_bot_token=required("TG_BOT_TOKEN"),
         tg_source_chat_id=required_int("TG_SOURCE_CHAT_ID"),
+        tg_source_chat_username=(os.getenv("TG_SOURCE_CHAT_USERNAME") or "").strip().lstrip("@"),
         tg_admin_id=required_int("TG_ADMIN_ID"),
         tg_polling_timeout_sec=env_int("TG_POLLING_TIMEOUT_SEC", 50, min_value=1),
         tg_polling_drop_pending_updates=env_bool("TG_POLLING_DROP_PENDING_UPDATES", False),
@@ -126,6 +129,18 @@ class MessageMapStore:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tg_message_archive (
+                tg_chat_id INTEGER NOT NULL,
+                tg_message_id INTEGER NOT NULL,
+                media_group_id TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (tg_chat_id, tg_message_id)
             )
             """
         )
@@ -179,6 +194,69 @@ class MessageMapStore:
     def get(self, tg_chat_id: int, tg_message_id: int) -> str | None:
         ids = self.get_ids(tg_chat_id, tg_message_id)
         return ids[0] if ids else None
+
+    def archive_post(
+        self,
+        tg_chat_id: int,
+        tg_message_id: int,
+        payload: dict[str, Any],
+        media_group_id: str = "",
+    ) -> None:
+        raw_value = json.dumps(payload, ensure_ascii=False)
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO tg_message_archive (tg_chat_id, tg_message_id, media_group_id, payload_json)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(tg_chat_id, tg_message_id) DO UPDATE SET
+                    media_group_id=excluded.media_group_id,
+                    payload_json=excluded.payload_json,
+                    updated_at=strftime('%s','now')
+                """,
+                (tg_chat_id, tg_message_id, media_group_id, raw_value),
+            )
+            self.conn.commit()
+
+    def get_archived_post(self, tg_chat_id: int, tg_message_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT payload_json
+                FROM tg_message_archive
+                WHERE tg_chat_id = ? AND tg_message_id = ?
+                """,
+                (tg_chat_id, tg_message_id),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def get_archived_media_group(self, tg_chat_id: int, media_group_id: str) -> list[dict[str, Any]]:
+        if not media_group_id:
+            return []
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT payload_json
+                FROM tg_message_archive
+                WHERE tg_chat_id = ? AND media_group_id = ?
+                ORDER BY tg_message_id ASC
+                """,
+                (tg_chat_id, media_group_id),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row[0])
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                items.append(payload)
+        return items
 
     def close(self) -> None:
         with self.lock:
@@ -1038,6 +1116,7 @@ class BridgeService:
     CONTINUATION_SUFFIX = "\n\n👇 ПРОДОЛЖЕНИЕ В СЛЕДУЮЩЕМ ПОСТЕ"
     MEDIA_GROUP_DELAY_SECONDS = 1.8
     TG_POLL_OFFSET_STATE_KEY = "tg_polling_offset"
+    TG_SOURCE_USERNAME_STATE_KEY = "tg_source_public_username"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -1070,6 +1149,8 @@ class BridgeService:
         if isinstance(post, dict):
             post_chat_id = self.extract_tg_chat_id(post)
             if self.is_allowed_source_chat(post_chat_id):
+                self.remember_source_chat_username(post)
+                self.archive_source_post(post)
                 media_group_id = post.get("media_group_id")
                 if isinstance(media_group_id, str) and media_group_id:
                     await self.enqueue_media_group_post(post)
@@ -1080,6 +1161,8 @@ class BridgeService:
         if isinstance(edited_post, dict):
             edited_chat_id = self.extract_tg_chat_id(edited_post)
             if self.is_allowed_source_chat(edited_chat_id):
+                self.remember_source_chat_username(edited_post)
+                self.archive_source_post(edited_post)
                 await self.process_edited_post(edited_post)
 
         message = update.get("message")
@@ -1092,9 +1175,6 @@ class BridgeService:
             return
 
         command = text.strip().split()[0].split("@")[0].lower()
-        if command not in {"/start", "/status", "/vk_session", "/check_session"}:
-            return
-
         if not self.is_admin_message(message):
             return
 
@@ -1104,6 +1184,10 @@ class BridgeService:
         chat_id = chat.get("id")
         if not isinstance(chat_id, int):
             return
+
+        if command not in {"/start", "/status", "/vk_session", "/check_session", "/replay"}:
+            return
+
         if command in {"/start", "/status"}:
             response_text = (
                 "Привет, админ. Я работаю.\n"
@@ -1113,6 +1197,15 @@ class BridgeService:
                 f"Session file exists: {'yes' if Path(self.settings.vk_storage_state_path).exists() else 'no'}"
             )
             await self.send_tg_message(chat_id=chat_id, text=response_text)
+            return
+
+        if command == "/replay":
+            try:
+                replay_result = await self.handle_replay_command(text)
+            except Exception as exc:
+                logging.exception("Failed to replay post by admin command")
+                replay_result = f"Replay failed: {exc}"
+            await self.send_tg_message(chat_id=chat_id, text=replay_result[:4000])
             return
 
         session_status = await self.run_vk_worker("VK session check", self.vk_poster.check_session)
@@ -1134,6 +1227,191 @@ class BridgeService:
             f"screenshot={session_status.get('screenshot')}"
         )
         await self.send_tg_message(chat_id=chat_id, text=response_text[:4000])
+
+    def remember_source_chat_username(self, post: dict[str, Any]) -> None:
+        chat = post.get("chat")
+        if not isinstance(chat, dict):
+            return
+        username = chat.get("username")
+        if not isinstance(username, str):
+            return
+        normalized = username.strip().lstrip("@")
+        if normalized:
+            self.message_map.set_state(self.TG_SOURCE_USERNAME_STATE_KEY, normalized)
+
+    def archive_source_post(self, post: dict[str, Any]) -> None:
+        tg_chat_id = self.extract_tg_chat_id(post)
+        tg_message_id = self.extract_tg_message_id(post)
+        if tg_chat_id is None or tg_message_id is None:
+            return
+        media_group_id = str(post.get("media_group_id") or "")
+        self.message_map.archive_post(
+            tg_chat_id=tg_chat_id,
+            tg_message_id=tg_message_id,
+            payload=post,
+            media_group_id=media_group_id,
+        )
+
+    async def handle_replay_command(self, command_text: str) -> str:
+        username, message_id = self.parse_replay_command(command_text)
+        if message_id is None:
+            return "Usage: /replay <message_id> or /replay https://t.me/<channel>/<message_id>"
+
+        archived_post, archived_chat_id = self.find_archived_post_for_replay(message_id)
+        if archived_post is not None and archived_chat_id is not None:
+            media_group_id = str(archived_post.get("media_group_id") or "")
+            if media_group_id:
+                posts = self.message_map.get_archived_media_group(archived_chat_id, media_group_id)
+                if posts:
+                    vk_post_ids = await self.replay_media_group_posts(posts)
+                    return (
+                        f"Replay OK: TG media group {message_id} -> VK {', '.join(vk_post_ids)}\n"
+                        "source=archive"
+                    )
+
+            vk_post_ids = await self.replay_single_post(archived_post)
+            return f"Replay OK: TG post {message_id} -> VK {', '.join(vk_post_ids)}\nsource=archive"
+
+        resolved_username = username or self.get_source_chat_username()
+        if not resolved_username:
+            return (
+                f"Replay failed for {message_id}: no archived payload and no source channel username. "
+                "Set TG_SOURCE_CHAT_USERNAME or use /replay https://t.me/<channel>/<message_id>"
+            )
+
+        vk_post_ids, used_fallback = await self.replay_public_post(resolved_username, message_id)
+        response = f"Replay OK: TG post {message_id} -> VK {', '.join(vk_post_ids)}\nsource=public_page"
+        if used_fallback:
+            response += (
+                "\nwarning=public replay may miss hidden Telegram text_link URLs because "
+                "t.me/s does not expose all entities"
+            )
+        return response
+
+    @staticmethod
+    def parse_replay_command(command_text: str) -> tuple[str | None, int | None]:
+        raw = (command_text or "").strip()
+        parts = raw.split(maxsplit=1)
+        if len(parts) < 2:
+            return None, None
+
+        target = parts[1].strip()
+        if not target:
+            return None, None
+
+        if target.isdigit():
+            return None, int(target)
+
+        match = re.search(r"t\.me/(?:s/)?([A-Za-z0-9_]+)/(\d+)", target, re.IGNORECASE)
+        if match:
+            return match.group(1), int(match.group(2))
+        return None, None
+
+    def get_source_chat_id_candidates(self) -> list[int]:
+        source_chat_id = self.settings.tg_source_chat_id
+        candidates: list[int] = []
+        for candidate in (source_chat_id,):
+            if candidate not in candidates:
+                candidates.append(candidate)
+        if source_chat_id > 0:
+            prefixed = int(f"-100{source_chat_id}")
+            if prefixed not in candidates:
+                candidates.append(prefixed)
+        elif str(source_chat_id).startswith("-100"):
+            short_id = int(str(source_chat_id)[4:])
+            if short_id not in candidates:
+                candidates.append(short_id)
+        return candidates
+
+    def find_archived_post_for_replay(self, message_id: int) -> tuple[dict[str, Any] | None, int | None]:
+        for tg_chat_id in self.get_source_chat_id_candidates():
+            archived = self.message_map.get_archived_post(tg_chat_id, message_id)
+            if archived is not None:
+                return archived, tg_chat_id
+        return None, None
+
+    def get_source_chat_username(self) -> str | None:
+        username = (self.settings.tg_source_chat_username or "").strip().lstrip("@")
+        if username:
+            return username
+        stored = (self.message_map.get_state(self.TG_SOURCE_USERNAME_STATE_KEY) or "").strip().lstrip("@")
+        return stored or None
+
+    async def replay_single_post(self, post: dict[str, Any]) -> list[str]:
+        source_text, entities = self.extract_text_and_entities(post)
+        tg_message_id = self.extract_tg_message_id(post)
+        tg_chat_id = self.extract_tg_chat_id(post)
+        text = self.convert_tg_entities_to_vk_text(source_text, entities).strip()
+        attachments = await self.build_vk_attachments(post)
+        if not text and not attachments:
+            raise RuntimeError("Archived post has no replayable text or attachments")
+        vk_post_ids = await self.publish_to_vk(text=text, attachments=attachments)
+        if tg_chat_id is not None and tg_message_id is not None and vk_post_ids:
+            self.message_map.put_ids(tg_chat_id, tg_message_id, vk_post_ids)
+        return vk_post_ids
+
+    async def replay_media_group_posts(self, posts: list[dict[str, Any]]) -> list[str]:
+        if not posts:
+            raise RuntimeError("Archived media group is empty")
+        posts = sorted(posts, key=lambda p: int(p.get("message_id") or 0))
+        lead_post = posts[0]
+        source_text = ""
+        source_entities: list[dict[str, Any]] = []
+        for post in posts:
+            text, entities = self.extract_text_and_entities(post)
+            if text.strip():
+                source_text = text
+                source_entities = entities
+                break
+
+        attachments: list[str] = []
+        for post in posts:
+            attachments.extend(await self.build_vk_attachments(post))
+
+        text = self.convert_tg_entities_to_vk_text(source_text, source_entities).strip()
+        vk_post_ids = await self.publish_to_vk(text=text, attachments=attachments)
+
+        tg_chat_id = self.extract_tg_chat_id(lead_post)
+        if tg_chat_id is not None and vk_post_ids:
+            for post in posts:
+                tg_message_id = self.extract_tg_message_id(post)
+                if tg_message_id is not None:
+                    self.message_map.put_ids(tg_chat_id, tg_message_id, vk_post_ids)
+        return vk_post_ids
+
+    async def replay_public_post(self, username: str, message_id: int) -> tuple[list[str], bool]:
+        snapshot = await self.fetch_public_post_snapshot(username, message_id)
+        attachments: list[str] = []
+        image_url = snapshot.get("image_url")
+        if isinstance(image_url, str) and image_url.strip():
+            image_response = await self.http.get(image_url)
+            image_response.raise_for_status()
+            image_path = self.media_tmp_dir / f"replay_public_{message_id}.jpg"
+            image_path.write_bytes(image_response.content)
+            attachments.append(str(image_path))
+
+        text = str(snapshot.get("text") or "").strip()
+        if not text and not attachments:
+            raise RuntimeError(f"Public replay could not extract content for TG post {message_id}")
+
+        vk_post_ids = await self.publish_to_vk(text=text, attachments=attachments)
+        if vk_post_ids:
+            self.message_map.put_ids(self.settings.tg_source_chat_id, message_id, vk_post_ids)
+        return vk_post_ids, True
+
+    async def fetch_public_post_snapshot(self, username: str, message_id: int) -> dict[str, str]:
+        public_url = f"https://t.me/s/{username}/{message_id}"
+        response = await self.http.get(public_url, follow_redirects=True)
+        response.raise_for_status()
+        raw_html = response.text or ""
+
+        text_match = re.search(r'<meta property="og:description" content="([^"]+)"', raw_html)
+        image_match = re.search(r'<meta property="og:image" content="([^"]+)"', raw_html)
+        text_value = html.unescape(text_match.group(1)) if text_match else ""
+        image_value = html.unescape(image_match.group(1)) if image_match else ""
+        if not text_value and not image_value:
+            raise RuntimeError(f"Public Telegram page has no replayable content: {public_url}")
+        return {"text": text_value, "image_url": image_value}
 
     def is_admin_message(self, message: dict[str, Any]) -> bool:
         admin_id = self.settings.tg_admin_id

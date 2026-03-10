@@ -43,6 +43,7 @@ copy .env.example .env
 - `VK_STORAGE_STATE_PATH` (файл сессии VK, например `vk_storage_state.json`)
 
 Опциональные:
+- `TG_SOURCE_CHAT_USERNAME` (например `yellow_web`; нужен для `/replay` fallback через публичную страницу Telegram)
 - `VK_ENABLE_EDIT_SYNC` (`false` по умолчанию)
 - `VK_BROWSER_HEADLESS` (`true` по умолчанию)
 - `VK_BROWSER_CHANNEL` (например `chrome`, `msedge`; можно пусто)
@@ -77,10 +78,13 @@ python app.py
 Админ-команды в Telegram:
 - `/start`, `/status` — состояние бота.
 - `/vk_session` или `/check_session` — проверка, что из сохраненной сессии извлекается рабочий web `access_token`.
+- `/replay <message_id>` — повторная публикация поста по TG `message_id`.
+- `/replay https://t.me/<channel>/<message_id>` — то же самое, но с явным URL канала.
 
 ## 6. Поведение
 
 - Публикация идет через VK API (`wall.post`, `photos.*`, `video.save`), токен берется из браузерной VK-сессии автоматически.
+- Бот архивирует сырой payload входящих `channel_post` / `edited_channel_post`, поэтому новые `/replay` сохраняют hidden Telegram entities, включая `text_link`.
 - Если в одном посте более 10 вложений, бот разобьет их на несколько постов.
 - Форматирование Telegram (bold/italic/underline/code) не переносится: в VK идет plain text.
 - При `VK_ENABLE_EDIT_SYNC=true`:
@@ -93,6 +97,7 @@ python app.py
 - Сессия VK не вечная: иногда потребуется заново прогнать `vk_session_refresh.py` и обновить файл состояния на сервере.
 - Если VK попросит повторный вход/капчу/подтверждение, бот не сможет публиковать, пока сессия не обновлена.
 - В текущей реализации вложения поддерживаются только для `image/*` и `video/*`.
+- Для старых постов, которые не были заархивированы ботом, `/replay` работает в best-effort режиме через публичную `t.me/s/...` страницу и может не восстановить hidden inline-ссылки.
 
 ## 8. Linux/systemd скрипты
 
