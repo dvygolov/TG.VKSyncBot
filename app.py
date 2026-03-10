@@ -224,6 +224,7 @@ class VkApiError(RuntimeError):
 class VkBrowserPoster:
     VK_API_BASE = "https://api.vk.com/method"
     VK_API_VERSION = "5.269"
+    VK_WEB_CLIENT_ID = "6287487"
 
     def __init__(self, settings: Settings) -> None:
         self.group_id = abs(settings.vk_group_id)
@@ -358,7 +359,9 @@ class VkBrowserPoster:
                 "source": "cache",
             }
 
-        token_info = self.extract_token_from_storage_state()
+        token_info = self.extract_token_via_session_cookies()
+        if not token_info:
+            token_info = self.extract_token_from_storage_state()
         if not token_info:
             token_info = self.extract_web_access_token()
         token = token_info.get("token")
@@ -369,7 +372,7 @@ class VkBrowserPoster:
         return {
             "token": token,
             "url": self._cached_token_url,
-            "source": "browser",
+            "source": token_info.get("source", "browser"),
         }
 
     def invalidate_cached_token(self) -> None:
@@ -550,6 +553,60 @@ class VkBrowserPoster:
                     "source": "storage_state_cookie",
                 }
         return None
+
+    def extract_token_via_session_cookies(self) -> dict[str, str] | None:
+        if not self.storage_state_path.exists():
+            return None
+
+        try:
+            payload = json.loads(self.storage_state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.warning("Failed to parse VK storage state file %s: %s", self.storage_state_path, exc)
+            return None
+
+        cookies: dict[str, str] = {}
+        for item in payload.get("cookies", []):
+            domain = str(item.get("domain") or "").lstrip(".").lower()
+            if domain.endswith("vk.com") or domain.endswith("vk.ru"):
+                name = str(item.get("name") or "").strip()
+                value = str(item.get("value") or "")
+                if name and value:
+                    cookies[name] = value
+
+        if not cookies:
+            return None
+
+        headers = {
+            "origin": "https://vk.com",
+            "referer": "https://vk.com/",
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/145.0.0.0 Safari/537.36"
+            ),
+        }
+        try:
+            with httpx.Client(headers=headers, cookies=cookies, follow_redirects=True, timeout=30.0) as client:
+                response = client.post(
+                    "https://login.vk.com/?act=web_token",
+                    data={"version": "1", "app_id": self.VK_WEB_CLIENT_ID},
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            logging.warning("Failed to refresh VK web token from session cookies: %s", exc)
+            return None
+
+        token = self.extract_token_from_text(
+            (data.get("data") or {}).get("access_token") if isinstance(data, dict) else None
+        )
+        if not token:
+            return None
+        return {
+            "token": token,
+            "url": "https://login.vk.com/?act=web_token",
+            "source": "session_cookies",
+        }
 
     def extract_web_access_token(self) -> dict[str, str]:
         try:
