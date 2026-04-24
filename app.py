@@ -1855,8 +1855,6 @@ class BridgeService:
         index_map = cls.utf16_to_py_index_map(text)
         total_utf16_units = len(index_map) - 1
         inserts: dict[int, list[str]] = {}
-        quote_ranges: list[tuple[int, int]] = []
-
         for entity in entities:
             entity_type = entity.get("type")
             offset = entity.get("offset")
@@ -1876,7 +1874,6 @@ class BridgeService:
                 continue
 
             if entity_type in {"blockquote", "expandable_blockquote", "quote"}:
-                quote_ranges.append((start, end))
                 continue
 
             if entity_type != "text_link":
@@ -1893,32 +1890,11 @@ class BridgeService:
                 continue
             inserts.setdefault(end, []).append(f" ({link})")
 
-        if quote_ranges:
-            quote_ranges.sort(key=lambda r: (r[0], r[1]))
-            merged_ranges: list[tuple[int, int]] = []
-            for start, end in quote_ranges:
-                if not merged_ranges:
-                    merged_ranges.append((start, end))
-                    continue
-                prev_start, prev_end = merged_ranges[-1]
-                if start > prev_end:
-                    merged_ranges.append((start, end))
-                else:
-                    merged_ranges[-1] = (prev_start, max(prev_end, end))
-            quote_ranges = merged_ranges
-
-        if not inserts and not quote_ranges:
+        if not inserts:
             return text
 
         out: list[str] = []
-        range_idx = 0
         for idx, ch in enumerate(text):
-            while range_idx < len(quote_ranges) and idx >= quote_ranges[range_idx][1]:
-                range_idx += 1
-            if range_idx < len(quote_ranges):
-                start, end = quote_ranges[range_idx]
-                if start <= idx < end and (idx == start or text[idx - 1] == "\n"):
-                    out.append(">> ")
             out.append(ch)
             suffixes = inserts.get(idx + 1)
             if suffixes:
