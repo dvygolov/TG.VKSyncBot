@@ -1,3 +1,20 @@
+```
+                             TG.VKSyncBot
+    _            __     __  _ _             __          __  _
+   | |           \ \   / / | | |            \ \        / / | |
+   | |__  _   _   \ \_/ /__| | | _____      _\ \  /\  / /__| |__
+   | '_ \| | | |   \   / _ \ | |/ _ \ \ /\ / /\ \/  \/ / _ \ '_ \
+   | |_) | |_| |    | |  __/ | | (_) \ V  V /  \  /\  /  __/ |_) |
+   |_.__/ \__, |    |_|\___|_|_|\___/ \_/\_/    \/  \/ \___|_.__/
+           __/ |
+          |___/             https://yellowweb.top
+
+If you like this script, PLEASE DONATE!
+```
+
+[Support this project](https://yellowweb.top/donate)
+
+
 # TG -> VK bridge
 
 Бот пересылает посты из Telegram-канала в стену сообщества VK через VK API, используя `access_token`, автоматически извлеченный из браузерной VK-сессии (Playwright).
