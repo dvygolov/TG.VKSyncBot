@@ -655,8 +655,8 @@ class VkBrowserPoster:
             return None
 
         headers = {
-            "origin": "https://vk.com",
-            "referer": "https://vk.com/",
+            "origin": "https://vk.ru",
+            "referer": "https://vk.ru/",
             "user-agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -666,7 +666,7 @@ class VkBrowserPoster:
         try:
             with httpx.Client(headers=headers, cookies=cookies, follow_redirects=True, timeout=30.0) as client:
                 response = client.post(
-                    "https://login.vk.com/?act=web_token",
+                    "https://login.vk.ru/?act=web_token",
                     data={"version": "1", "app_id": self.VK_WEB_CLIENT_ID},
                 )
                 response.raise_for_status()
@@ -682,7 +682,7 @@ class VkBrowserPoster:
             return None
         return {
             "token": token,
-            "url": "https://login.vk.com/?act=web_token",
+            "url": "https://login.vk.ru/?act=web_token",
             "source": "session_cookies",
         }
 
