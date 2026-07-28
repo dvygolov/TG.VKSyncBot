@@ -25,6 +25,8 @@ def read_payload() -> dict[str, Any]:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     if len(sys.argv) < 2:
         print(json.dumps({"ok": False, "error": "Missing VK worker operation"}))
         return 2

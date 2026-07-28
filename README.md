@@ -25,6 +25,8 @@ If you like this script, PLEASE DONATE!
 - фото,
 - видео,
 - media group (несколько вложений в одном посте),
+- Telegram Rich Messages/articles: структура превращается в plain text, а вложенные
+  фото, видео и анимации — в VK attachments,
 - длинные тексты с разбиением на несколько постов.
 
 ## 1. Требования
@@ -69,6 +71,8 @@ copy .env.example .env
 - `VK_MEDIA_TMP_DIR` (временная папка для медиа, по умолчанию `.vk_media_tmp`)
 - `STATE_DB_PATH`
 - `REPOST_ALL_POSTS`
+- `REPOST_RICH_MESSAGES` (`true` по умолчанию; публиковать Rich Messages/articles
+  независимо от фильтра по завершающему хештегу)
 
 ## 4. Обновление VK-сессии
 
@@ -101,7 +105,13 @@ python app.py
 ## 6. Поведение
 
 - Публикация идет через VK API (`wall.post`, `photos.*`, `video.save`), токен берется из браузерной VK-сессии автоматически.
+- Временные сетевые ошибки VK API и upload-серверов повторяются автоматически.
+  Для `wall.post` используется уникальный `guid`, чтобы повтор запроса не создавал
+  дубликат после потерянного ответа.
 - Бот архивирует сырой payload входящих `channel_post` / `edited_channel_post`, поэтому новые `/replay` сохраняют hidden Telegram entities, включая `text_link`.
+- Rich Messages/articles публикуются как обычный текст без Telegram-оформления.
+  Ссылки дописываются после текста ссылки в скобках, вложенные изображения и видео
+  собираются рекурсивно из article и прикрепляются к VK-посту.
 - Если в одном посте более 10 вложений, бот разобьет их на несколько постов.
 - Форматирование Telegram (bold/italic/underline/code) не переносится: в VK идет plain text.
 - При `VK_ENABLE_EDIT_SYNC=true`:

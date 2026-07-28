@@ -42,6 +42,7 @@ class Settings:
     vk_media_tmp_dir: str
     state_db_path: str
     repost_all_posts: bool
+    repost_rich_messages: bool
 
 
 def load_settings() -> Settings:
@@ -102,6 +103,7 @@ def load_settings() -> Settings:
         vk_media_tmp_dir=(os.getenv("VK_MEDIA_TMP_DIR") or ".vk_media_tmp").strip(),
         state_db_path=os.getenv("STATE_DB_PATH", "bridge_state.db"),
         repost_all_posts=env_bool("REPOST_ALL_POSTS", True),
+        repost_rich_messages=env_bool("REPOST_RICH_MESSAGES", True),
     )
 
 
@@ -303,6 +305,8 @@ class VkBrowserPoster:
     VK_API_BASE = "https://api.vk.com/method"
     VK_API_VERSION = "5.269"
     VK_WEB_CLIENT_ID = "6287487"
+    VK_API_RETRY_CODES = {1, 6, 9, 10}
+    RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0, 4.0)
 
     def __init__(self, settings: Settings) -> None:
         self.group_id = abs(settings.vk_group_id)
@@ -350,6 +354,8 @@ class VkBrowserPoster:
             self.lock.release()
 
     def _post_impl(self, text: str, attachment_paths: list[str]) -> str | None:
+        request_guid = uuid.uuid4().hex
+
         def operation(client: httpx.Client, token: str) -> Any:
             attachments = self.upload_attachments_via_api(
                 client=client,
@@ -367,6 +373,7 @@ class VkBrowserPoster:
                 signed=0,
                 close_comments=0,
                 mute_notifications=0,
+                guid=request_guid,
             )
 
         response, _ = self.call_with_token_retry(timeout_sec=120.0, operation=operation)
@@ -788,18 +795,48 @@ class VkBrowserPoster:
                 continue
             payload[key] = value
 
-        for attempt in range(5):
-            response = client.post(endpoint, data=payload)
-            response.raise_for_status()
-            data = response.json()
+        max_attempts = len(self.RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(max_attempts):
+            try:
+                response = client.post(endpoint, data=payload)
+                response.raise_for_status()
+                data = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                if attempt >= max_attempts - 1:
+                    raise RuntimeError(
+                        f"VK API {method} transport failed after {max_attempts} attempts: {exc}"
+                    ) from exc
+                delay = self.RETRY_DELAYS_SECONDS[attempt]
+                logging.warning(
+                    "VK API %s transport failure (attempt %s/%s), retrying in %.1fs: %s",
+                    method,
+                    attempt + 1,
+                    max_attempts,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+                continue
+
             error = data.get("error")
             if not error:
                 return data.get("response")
 
             code = error.get("error_code")
             message = error.get("error_msg") or "Unknown VK API error"
-            if code == 6 and attempt < 4:
-                time.sleep(0.45)
+            if code in self.VK_API_RETRY_CODES and attempt < max_attempts - 1:
+                delay = self.RETRY_DELAYS_SECONDS[attempt]
+                logging.warning(
+                    "VK API %s returned retryable error code=%s (attempt %s/%s), "
+                    "retrying in %.1fs: %s",
+                    method,
+                    code,
+                    attempt + 1,
+                    max_attempts,
+                    delay,
+                    message,
+                )
+                time.sleep(delay)
                 continue
             raise VkApiError(method=method, code=code, message=message)
         raise VkApiError(method=method, code=None, message="failed after retries")
@@ -836,13 +873,14 @@ class VkBrowserPoster:
         if not upload_url:
             raise RuntimeError("VK API photos.getWallUploadServer returned no upload_url.")
 
-        with path.open("rb") as file_handle:
-            upload_response = client.post(
-                upload_url,
-                files={"photo": (path.name, file_handle, mimetypes.guess_type(str(path))[0] or "image/jpeg")},
-            )
-        upload_response.raise_for_status()
-        upload_data = upload_response.json()
+        upload_data = self.upload_file_with_retries(
+            client=client,
+            upload_url=upload_url,
+            field_name="photo",
+            path=path,
+            mime_type=mimetypes.guess_type(str(path))[0] or "image/jpeg",
+            required_fields=("photo", "server", "hash"),
+        )
 
         saved = self.vk_api_call(
             client=client,
@@ -877,14 +915,75 @@ class VkBrowserPoster:
         if not upload_url or owner_id is None or video_id is None:
             raise RuntimeError("VK API video.save returned incomplete upload data.")
 
-        with path.open("rb") as file_handle:
-            upload_response = client.post(
-                upload_url,
-                files={"video_file": (path.name, file_handle, mimetypes.guess_type(str(path))[0] or "video/mp4")},
-                timeout=600.0,
-            )
-        upload_response.raise_for_status()
+        self.upload_file_with_retries(
+            client=client,
+            upload_url=upload_url,
+            field_name="video_file",
+            path=path,
+            mime_type=mimetypes.guess_type(str(path))[0] or "video/mp4",
+            timeout=600.0,
+        )
         return f"video{owner_id}_{video_id}"
+
+    def upload_file_with_retries(
+        self,
+        *,
+        client: httpx.Client,
+        upload_url: str,
+        field_name: str,
+        path: Path,
+        mime_type: str,
+        timeout: float | None = None,
+        required_fields: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        max_attempts = len(self.RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(max_attempts):
+            try:
+                request_kwargs: dict[str, Any] = {}
+                with path.open("rb") as file_handle:
+                    request_kwargs["files"] = {
+                        field_name: (path.name, file_handle, mime_type),
+                    }
+                    if timeout is not None:
+                        request_kwargs["timeout"] = timeout
+                    response = client.post(
+                        upload_url,
+                        **request_kwargs,
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise RuntimeError("upload endpoint returned a non-object JSON response")
+                if payload.get("error"):
+                    raise RuntimeError(f"upload endpoint returned error: {payload.get('error')}")
+                missing_fields = [
+                    field
+                    for field in required_fields
+                    if payload.get(field) in (None, "", "[]", [], {})
+                ]
+                if missing_fields:
+                    raise RuntimeError(
+                        "upload endpoint returned empty required fields: "
+                        + ", ".join(missing_fields)
+                    )
+                return payload
+            except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                if attempt >= max_attempts - 1:
+                    raise RuntimeError(
+                        f"VK media upload failed for {path.name} after {max_attempts} attempts: {exc}"
+                    ) from exc
+                delay = self.RETRY_DELAYS_SECONDS[attempt]
+                logging.warning(
+                    "VK media upload failed for %s (attempt %s/%s), retrying in %.1fs: %s",
+                    path.name,
+                    attempt + 1,
+                    max_attempts,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+
+        raise RuntimeError(f"VK media upload failed for {path.name}")
 
     def has_composer_surface(self, page: Any) -> bool:
         selectors = [
@@ -1460,7 +1559,7 @@ class BridgeService:
 
     async def process_single_post(self, post: dict[str, Any]) -> None:
         source_text, entities = self.extract_text_and_entities(post)
-        if not self.should_repost(source_text):
+        if not self.should_repost_post(post, source_text):
             return
 
         tg_message_id = self.extract_tg_message_id(post)
@@ -1498,7 +1597,7 @@ class BridgeService:
                 break
 
         group_key = self.media_group_key(lead_post)
-        if not self.should_repost(source_text):
+        if not self.should_repost_post(lead_post, source_text):
             self.media_group_archive[group_key] = posts
             return
 
@@ -1543,7 +1642,7 @@ class BridgeService:
             return
 
         source_text, entities = self.extract_text_and_entities(post)
-        should_repost_now = self.should_repost(source_text)
+        should_repost_now = self.should_repost_post(post, source_text)
         existing_vk_post_ids = self.message_map.get_ids(tg_chat_id, tg_message_id)
 
         media_group_id = post.get("media_group_id")
@@ -1671,6 +1770,11 @@ class BridgeService:
             return True
         return self.is_author_post((text or "").strip())
 
+    def should_repost_post(self, post: dict[str, Any], text: str) -> bool:
+        if self.settings.repost_rich_messages and isinstance(post.get("rich_message"), dict):
+            return True
+        return self.should_repost(text)
+
     @staticmethod
     def is_author_post(text: str) -> bool:
         if not text:
@@ -1680,8 +1784,8 @@ class BridgeService:
             return False
         return parts[-1].startswith("#")
 
-    @staticmethod
-    def extract_text_and_entities(post: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    @classmethod
+    def extract_text_and_entities(cls, post: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         text = post.get("text")
         if isinstance(text, str):
             entities = post.get("entities")
@@ -1696,7 +1800,145 @@ class BridgeService:
                 return caption, [e for e in entities if isinstance(e, dict)]
             return caption, []
 
+        rich_message = post.get("rich_message")
+        if isinstance(rich_message, dict):
+            blocks = rich_message.get("blocks")
+            if isinstance(blocks, list):
+                return cls.rich_blocks_to_vk_text(blocks), []
+
         return "", []
+
+    @classmethod
+    def rich_text_to_vk_text(cls, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(cls.rich_text_to_vk_text(item) for item in value)
+        if not isinstance(value, dict):
+            return ""
+
+        rich_type = str(value.get("type") or "")
+        text = cls.rich_text_to_vk_text(value.get("text"))
+        if rich_type == "custom_emoji":
+            return str(value.get("alternative_text") or text)
+        if rich_type == "mathematical_expression":
+            return str(value.get("expression") or text)
+        if rich_type == "url":
+            url = str(value.get("url") or "").strip()
+            if not url:
+                return text
+            if text and cls.normalize_match_text(text) == cls.normalize_match_text(url):
+                return text
+            return f"{text} ({url})" if text else url
+        if rich_type == "email_address":
+            address = str(value.get("email_address") or "").strip()
+            if address and cls.normalize_match_text(text) != cls.normalize_match_text(address):
+                return f"{text} ({address})" if text else address
+        if rich_type == "phone_number":
+            number = str(value.get("phone_number") or "").strip()
+            if number and cls.normalize_match_text(text) != cls.normalize_match_text(number):
+                return f"{text} ({number})" if text else number
+        return text
+
+    @classmethod
+    def rich_caption_to_vk_text(cls, caption: Any) -> str:
+        if not isinstance(caption, dict):
+            return cls.rich_text_to_vk_text(caption).strip()
+        text = cls.rich_text_to_vk_text(caption.get("text")).strip()
+        credit = cls.rich_text_to_vk_text(caption.get("credit")).strip()
+        if text and credit:
+            return f"{text}\n— {credit}"
+        return text or credit
+
+    @classmethod
+    def rich_blocks_to_vk_text(cls, blocks: list[Any]) -> str:
+        parts: list[str] = []
+        for block in blocks:
+            rendered = cls.rich_block_to_vk_text(block).strip()
+            if rendered:
+                parts.append(rendered)
+        return "\n\n".join(parts).strip()
+
+    @classmethod
+    def rich_block_to_vk_text(cls, block: Any) -> str:
+        if not isinstance(block, dict):
+            return cls.rich_text_to_vk_text(block)
+
+        block_type = str(block.get("type") or "")
+        if block_type in {"paragraph", "heading", "pre", "footer"}:
+            return cls.rich_text_to_vk_text(block.get("text"))
+        if block_type == "divider":
+            return "—"
+        if block_type == "mathematical_expression":
+            return str(block.get("expression") or "")
+        if block_type == "pullquote":
+            text = cls.rich_text_to_vk_text(block.get("text")).strip()
+            credit = cls.rich_text_to_vk_text(block.get("credit")).strip()
+            return f"«{text}»\n— {credit}" if text and credit else text or credit
+        if block_type == "list":
+            rendered_items: list[str] = []
+            items = block.get("items")
+            if not isinstance(items, list):
+                return ""
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label") or "•").strip() or "•"
+                item_blocks = item.get("blocks")
+                item_text = (
+                    cls.rich_blocks_to_vk_text(item_blocks)
+                    if isinstance(item_blocks, list)
+                    else cls.rich_text_to_vk_text(item.get("text"))
+                ).strip()
+                if item_text:
+                    rendered_items.append(f"{label} {item_text}".strip())
+            return "\n".join(rendered_items)
+        if block_type in {"blockquote", "collage", "slideshow"}:
+            nested = block.get("blocks")
+            body = cls.rich_blocks_to_vk_text(nested) if isinstance(nested, list) else ""
+            credit = cls.rich_text_to_vk_text(block.get("credit")).strip()
+            caption = cls.rich_caption_to_vk_text(block.get("caption"))
+            return "\n".join(part for part in (body, caption, f"— {credit}" if credit else "") if part)
+        if block_type == "details":
+            summary = cls.rich_text_to_vk_text(block.get("summary")).strip()
+            nested = block.get("blocks")
+            body = cls.rich_blocks_to_vk_text(nested) if isinstance(nested, list) else ""
+            return "\n".join(part for part in (summary, body) if part)
+        if block_type == "table":
+            lines: list[str] = []
+            caption = cls.rich_text_to_vk_text(block.get("caption")).strip()
+            if caption:
+                lines.append(caption)
+            rows = block.get("cells")
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, list):
+                        continue
+                    cells = [
+                        cls.rich_text_to_vk_text(cell.get("text")).strip()
+                        for cell in row
+                        if isinstance(cell, dict)
+                    ]
+                    if cells:
+                        lines.append(" | ".join(cells))
+            return "\n".join(lines)
+        if block_type == "map":
+            location = block.get("location")
+            caption = cls.rich_caption_to_vk_text(block.get("caption"))
+            if isinstance(location, dict):
+                latitude = location.get("latitude")
+                longitude = location.get("longitude")
+                if latitude is not None and longitude is not None:
+                    map_url = f"https://maps.google.com/?q={latitude},{longitude}"
+                    return "\n".join(part for part in (caption, map_url) if part)
+            return caption
+        if block_type in {"photo", "video", "animation", "audio", "voice_note"}:
+            return cls.rich_caption_to_vk_text(block.get("caption"))
+
+        text = cls.rich_text_to_vk_text(block.get("text"))
+        nested = block.get("blocks")
+        body = cls.rich_blocks_to_vk_text(nested) if isinstance(nested, list) else ""
+        return "\n".join(part for part in (text, body) if part)
 
     @staticmethod
     def media_group_key(post: dict[str, Any]) -> str:
@@ -1902,23 +2144,25 @@ class BridgeService:
         return "".join(out)
 
     async def build_vk_attachments(self, post: dict[str, Any]) -> list[str]:
-        media = self.extract_media(post)
-        if media is None:
-            return []
-
-        file_id, media_kind, fallback_name, mime_type = media
-        file_bytes, file_name = await self.download_tg_file(file_id)
-        if not file_name:
-            file_name = fallback_name
-        if not mime_type:
-            mime_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
-        local_path = self.save_media_file(
-            file_bytes=file_bytes,
-            file_name=file_name,
-            media_kind=media_kind,
-            mime_type=mime_type,
-        )
-        return [local_path]
+        attachments: list[str] = []
+        try:
+            for file_id, media_kind, fallback_name, mime_type in self.extract_media_items(post):
+                file_bytes, file_name = await self.download_tg_file(file_id)
+                if not file_name:
+                    file_name = fallback_name
+                if not mime_type:
+                    mime_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+                local_path = self.save_media_file(
+                    file_bytes=file_bytes,
+                    file_name=file_name,
+                    media_kind=media_kind,
+                    mime_type=mime_type,
+                )
+                attachments.append(local_path)
+            return attachments
+        except Exception:
+            self.cleanup_media_files(attachments)
+            raise
 
     def save_media_file(
         self,
@@ -1952,44 +2196,116 @@ class BridgeService:
                 logging.warning("Failed to cleanup temp media file: %s", raw_path)
 
     def extract_media(self, post: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        items = self.extract_media_items(post)
+        return items[0] if items else None
+
+    @classmethod
+    def extract_media_items(cls, post: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+        media: list[tuple[str, str, str, str]] = []
+
         photos = post.get("photo")
         if isinstance(photos, list) and photos:
-            last_photo = photos[-1]
-            file_id = last_photo.get("file_id")
-            if file_id:
-                return file_id, "photo", "photo.jpg", "image/jpeg"
+            photo = cls.extract_rich_photo(photos)
+            if photo:
+                media.append(photo)
 
         video = post.get("video")
         if isinstance(video, dict) and video.get("file_id"):
             name = video.get("file_name") or "video.mp4"
             mime_type = video.get("mime_type") or "video/mp4"
-            return video["file_id"], "video", name, mime_type
+            media.append((video["file_id"], "video", name, mime_type))
 
         animation = post.get("animation")
         if isinstance(animation, dict) and animation.get("file_id"):
             name = animation.get("file_name") or "animation.mp4"
             mime_type = animation.get("mime_type") or "video/mp4"
-            return animation["file_id"], "video", name, mime_type
+            media.append((animation["file_id"], "video", name, mime_type))
 
         document = post.get("document")
-        if isinstance(document, dict) and document.get("file_id"):
+        if (
+            isinstance(document, dict)
+            and document.get("file_id")
+            and not media
+        ):
             name = document.get("file_name") or "document.bin"
             mime_type = document.get("mime_type") or "application/octet-stream"
-            return document["file_id"], "doc", name, mime_type
+            media.append((document["file_id"], "doc", name, mime_type))
 
         audio = post.get("audio")
         if isinstance(audio, dict) and audio.get("file_id"):
             name = audio.get("file_name") or "audio.mp3"
             mime_type = audio.get("mime_type") or "audio/mpeg"
-            return audio["file_id"], "doc", name, mime_type
+            media.append((audio["file_id"], "doc", name, mime_type))
 
         voice = post.get("voice")
         if isinstance(voice, dict) and voice.get("file_id"):
             name = "voice.ogg"
             mime_type = voice.get("mime_type") or "audio/ogg"
-            return voice["file_id"], "doc", name, mime_type
+            media.append((voice["file_id"], "doc", name, mime_type))
 
-        return None
+        rich_message = post.get("rich_message")
+        if isinstance(rich_message, dict):
+            blocks = rich_message.get("blocks")
+            if isinstance(blocks, list):
+                media.extend(cls.extract_rich_block_media(blocks))
+
+        deduplicated: list[tuple[str, str, str, str]] = []
+        seen_file_ids: set[str] = set()
+        for item in media:
+            if item[0] in seen_file_ids:
+                continue
+            seen_file_ids.add(item[0])
+            deduplicated.append(item)
+        return deduplicated
+
+    @staticmethod
+    def extract_rich_photo(photos: Any) -> tuple[str, str, str, str] | None:
+        if not isinstance(photos, list):
+            return None
+        candidates = [photo for photo in photos if isinstance(photo, dict) and photo.get("file_id")]
+        if not candidates:
+            return None
+        best = max(
+            candidates,
+            key=lambda photo: (
+                int(photo.get("file_size") or 0),
+                int(photo.get("width") or 0) * int(photo.get("height") or 0),
+            ),
+        )
+        return str(best["file_id"]), "photo", "photo.jpg", "image/jpeg"
+
+    @classmethod
+    def extract_rich_block_media(cls, blocks: list[Any]) -> list[tuple[str, str, str, str]]:
+        media: list[tuple[str, str, str, str]] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "")
+            if block_type == "photo":
+                photo = cls.extract_rich_photo(block.get("photo"))
+                if photo:
+                    media.append(photo)
+            elif block_type in {"video", "animation"}:
+                item = block.get(block_type)
+                if isinstance(item, dict) and item.get("file_id"):
+                    fallback = "animation.mp4" if block_type == "animation" else "video.mp4"
+                    name = str(item.get("file_name") or fallback)
+                    mime_type = str(item.get("mime_type") or "video/mp4")
+                    media.append((str(item["file_id"]), "video", name, mime_type))
+
+            nested = block.get("blocks")
+            if isinstance(nested, list):
+                media.extend(cls.extract_rich_block_media(nested))
+
+            items = block.get("items")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_blocks = item.get("blocks")
+                    if isinstance(item_blocks, list):
+                        media.extend(cls.extract_rich_block_media(item_blocks))
+        return media
 
     async def download_tg_file(self, file_id: str) -> tuple[bytes, str | None]:
         get_file_url = f"https://api.telegram.org/bot{self.settings.tg_bot_token}/getFile"
@@ -2067,9 +2383,9 @@ class BridgeService:
                 ) from exc
 
         if process.returncode != 0:
-            stderr_preview = (stderr or b"").decode("utf-8", errors="replace").strip()[:1000]
+            worker_error = self.extract_vk_worker_error(stdout=stdout, stderr=stderr)
             raise RuntimeError(
-                f"{operation_name} worker failed with code {process.returncode}: {stderr_preview}"
+                f"{operation_name} worker failed with code {process.returncode}: {worker_error}"
             )
 
         try:
@@ -2081,6 +2397,34 @@ class BridgeService:
             error_text = str(response.get("error") or "Unknown VK worker error")
             raise RuntimeError(error_text)
         return response.get("result")
+
+    @staticmethod
+    def extract_vk_worker_error(stdout: bytes | None, stderr: bytes | None) -> str:
+        stdout_text = (stdout or b"").decode("utf-8", errors="replace").strip()
+        if stdout_text:
+            try:
+                payload = json.loads(stdout_text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict) and payload.get("error"):
+                return str(payload["error"])[:3000]
+
+        stderr_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+        stderr_text = re.sub(
+            r"(api\.telegram\.org/(?:file/)?bot)\d+:[A-Za-z0-9_-]+",
+            r"\1<redacted>",
+            stderr_text,
+            flags=re.IGNORECASE,
+        )
+        stderr_text = re.sub(
+            r"([?&](?:access_token|token)=)[^&\s\"]+",
+            r"\1<redacted>",
+            stderr_text,
+            flags=re.IGNORECASE,
+        )
+        if not stderr_text:
+            return "worker exited without an error message"
+        return stderr_text[-3000:]
 
     async def terminate_vk_worker_process(self, process: asyncio.subprocess.Process) -> None:
         try:
@@ -2186,6 +2530,8 @@ def configure_logging(level: str) -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 async def run_polling(settings: Settings) -> None:
